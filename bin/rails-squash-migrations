@@ -1,0 +1,96 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'active_record'
+require 'tempfile'
+require 'open3'
+
+begin
+  require 'strong_migrations'
+rescue LoadError
+  strong_migrations = false
+else
+  strong_migrations = true
+end
+
+def subprocess(*args)
+  stdin, stdout, wait_thr = Open3.popen2(*args)
+  stdin.close
+  out = stdout.read
+  stdout.close
+  status = wait_thr.value
+
+  raise "Command failed: #{status}\n\n  #{Shellwords.join(args)}\n" if status != 0
+
+  out
+end
+
+MIGRATIONS_DIR = 'db/migrate/'
+MIGRATION_NAME_RE = /\A(\d+)(.*)\z/
+SCHEMA_DEFINE_RE = /
+  \AActiveRecord::Schema\[(?<ar_version>\d+\.\d+)\]\.define\(
+  version:\s(?<schema_version>\d{4}_\d{2}_\d{2}_\d{6})
+  \)\sdo\z
+/x
+FORCE_CASCADE_RE = /\A(.*), force: :cascade(.*)\z/
+
+ref = ARGV.first || 'refs/heads/main'
+
+out = subprocess('git', 'ls-files', '--', MIGRATIONS_DIR)
+out.lines(chomp: true).to_a.sort
+
+out = subprocess('git', 'ls-tree', '--name-only', ref, '--', MIGRATIONS_DIR)
+ref_migrations = out.lines(chomp: true).to_a.sort
+
+basename = File.basename(ref_migrations.last)
+match = MIGRATION_NAME_RE.match(basename)
+
+versions = nil
+
+schema_contents = subprocess('git', 'cat-file', 'blob', "#{ref}:db/schema.rb")
+
+tmp = Tempfile.new
+begin
+  begin
+    schema_contents.each_line(chomp: true) do |line|
+      match = SCHEMA_DEFINE_RE.match(line)
+      if match
+        raise 'Found ActiveRecord::Schema.define line more than once' if versions
+
+        versions = {
+          ar: match[:ar_version],
+          schema: match[:schema_version].delete('_')
+        }
+
+        tmp.puts "class SquashedMigrations < ActiveRecord::Migration[#{versions[:ar]}]"
+        tmp.puts 'def change'
+        # SquashedMigrations are not run in production, prevent flagging as
+        # unsafe.
+        tmp.puts 'safety_assured do' if strong_migrations
+      else
+        match = FORCE_CASCADE_RE.match(line)
+        line = match.captures.join if match
+
+        tmp.puts line
+      end
+    end
+
+    # Extra ends to close the added change method and safety_assured block.
+    tmp.puts 'end' if strong_migrations
+    tmp.puts 'end'
+  ensure
+    tmp.close
+  end
+rescue StandardError
+  tmp.delete
+  raise
+end
+
+raise 'Failed to find ActiveRecord::Schema.define line' unless versions
+
+migration_path = File.join('db', 'migrate', "#{versions[:schema]}_squashed_migrations.rb")
+FileUtils.mv tmp.path, migration_path
+
+to_remove = ref_migrations - [migration_path]
+system('git', 'rm', *to_remove, exception: true) unless to_remove.empty?
+system('git', 'add', migration_path, exception: true)
